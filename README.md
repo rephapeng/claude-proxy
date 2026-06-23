@@ -57,12 +57,45 @@ Evonic chooses its wire format from the provider's `api_format` field (default
   text deltas re-emitted as OpenAI SSE `chat.completion.chunk`s + `[DONE]`
 - token counts mapped from the CLI's `usage` block
 
+## Function / tool calling
+The proxy emulates OpenAI function calling with a prompt protocol (the `claude`
+CLI has no native OpenAI tool-calling in `-p` mode):
+
+1. Request `tools` are described in an injected system instruction that tells the
+   model to emit a fenced ```` ```tool_call {json} ``` ```` block to call one.
+2. Those blocks are parsed back into a standard OpenAI
+   `choices[0].message.tool_calls[]` with `finish_reason: "tool_calls"`.
+3. On the next turn, incoming `role:"tool"` results and prior assistant
+   `tool_calls` are rendered into the transcript so the model can produce a final
+   answer.
+
+This is reliable for normal agentic loops (Evonic's included) but is prompt-based,
+not a native API feature — very large/complex tool schemas may need tuning.
+
+## Keep it running
+
+### systemd
+```bash
+sudo cp claude-proxy.service /etc/systemd/system/claude-proxy@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-proxy@youruser   # the user that ran `claude` login
+systemctl status claude-proxy@youruser
+```
+
+### Docker
+The `claude` CLI needs your Claude Code credentials (`~/.claude`), so mount them —
+never bake them into the image:
+```bash
+docker compose up -d --build       # uses docker-compose.yml
+# or:
+docker build -t claude-proxy .
+docker run --rm -p 8088:8088 -v "$HOME/.claude:/root/.claude" claude-proxy
+```
+
 ## Limitations / notes
-- **Tool calls / function calling are not translated** — this is a text-in/text-out
-  chat proxy. The underlying Claude Code session may still use its own tools.
+- Tool calling is **prompt-emulated**, not a native API capability (see above).
 - One CLI process per request (stateless); multi-turn context is replayed each call.
 - **ToS:** using a Claude Max subscription as a generic API backend for a
   third-party app may violate Anthropic's Terms of Service. Unofficial; no SLA;
   may break on `claude` CLI updates. Use at your own risk. For production, a real
   Anthropic API key (or OpenRouter) is the supported path.
-# claude-proxy

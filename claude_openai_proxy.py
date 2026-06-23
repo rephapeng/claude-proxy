@@ -9,7 +9,8 @@ which has no raw API key.
 
 Endpoints:
   GET  /v1/models             -> list exposed model ids
-  POST /v1/chat/completions   -> OpenAI chat completion (stream + non-stream)
+  POST /v1/chat/completions   -> OpenAI chat completion (stream + non-stream,
+                                 with prompt-based function/tool calling)
   GET  /health                -> {"ok": true}
 
 Usage:
@@ -25,6 +26,7 @@ third-party app may violate Anthropic's Terms of Service. Use at your own risk.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,9 +42,6 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_MODEL = os.environ.get("CLAUDE_PROXY_DEFAULT_MODEL", "sonnet")
 CALL_TIMEOUT = int(os.environ.get("CLAUDE_PROXY_TIMEOUT", "600"))
 
-# Models advertised on /v1/models. The proxy maps any incoming model id straight
-# through to `claude --model <id>`, so aliases (sonnet/opus/haiku) and full ids
-# (claude-sonnet-4-6) both work. This list is just what clients see when they ask.
 EXPOSED_MODELS = [
     "claude-sonnet-4-6",
     "claude-opus-4-8",
@@ -54,7 +53,7 @@ EXPOSED_MODELS = [
 
 
 # ---------------------------------------------------------------------------
-# OpenAI <-> Claude CLI translation
+# OpenAI message -> text helpers
 # ---------------------------------------------------------------------------
 
 def _content_to_text(content):
@@ -77,14 +76,88 @@ def _content_to_text(content):
     return str(content)
 
 
-def messages_to_prompt(messages):
+# ---------------------------------------------------------------------------
+# Function/tool calling shim
+#
+# The claude CLI in -p mode does not expose OpenAI function-calling. We emulate
+# it with a prompt protocol: describe the tools, instruct the model to emit a
+# fenced ```tool_call <json>``` block when it wants to call one, then parse that
+# block back into OpenAI `tool_calls`. Tool *results* coming back from the client
+# (role:"tool") and prior assistant tool_calls are rendered into the transcript
+# so the model has the full picture.
+# ---------------------------------------------------------------------------
+
+TOOL_CALL_RE = re.compile(r"```tool_call\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def build_tools_system_prompt(tools):
+    """Render OpenAI tool definitions into a system-prompt instruction block."""
+    if not tools:
+        return ""
+    lines = [
+        "You have access to the following tools (functions). When you need to "
+        "call one, respond with ONLY a fenced code block of the form:",
+        "",
+        "```tool_call",
+        '{"name": "<function_name>", "arguments": {<json args>}}',
+        "```",
+        "",
+        "Emit one such block per tool call. You may emit multiple blocks to call "
+        "several tools. Do not add prose around the block(s) when calling a tool. "
+        "If you do not need a tool, just answer normally.",
+        "",
+        "Available tools:",
+    ]
+    for t in tools:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        lines.append(f"- {name}: {desc}")
+        try:
+            lines.append(f"  parameters schema: {json.dumps(params)}")
+        except (TypeError, ValueError):
+            pass
+    return "\n".join(lines)
+
+
+def extract_tool_calls(text):
+    """
+    Find ```tool_call {json}``` blocks in model output.
+    Returns (list_of_openai_tool_calls, leftover_text).
+    """
+    if not text or "tool_call" not in text:
+        return [], text
+    calls = []
+    for m in TOOL_CALL_RE.finditer(text):
+        try:
+            obj = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        name = obj.get("name")
+        if not name:
+            continue
+        args = obj.get("arguments", {})
+        if not isinstance(args, str):
+            args = json.dumps(args)
+        calls.append({
+            "id": "call_" + uuid.uuid4().hex[:24],
+            "type": "function",
+            "function": {"name": name, "arguments": args},
+        })
+    leftover = TOOL_CALL_RE.sub("", text).strip()
+    return calls, leftover
+
+
+def messages_to_prompt(messages, tools=None):
     """
     Split OpenAI messages into (system_prompt, user_prompt).
 
     System messages are concatenated and handed to the CLI via
-    --append-system-prompt. The remaining conversation is flattened into a single
-    prompt with role labels so multi-turn context is preserved. The CLI is
-    stateless per call here, so we replay the whole transcript each request.
+    --append-system-prompt, along with the tool-protocol instructions. The
+    remaining conversation (including prior tool calls and tool results) is
+    flattened into a single prompt with role labels so multi-turn context and
+    function-calling history are preserved.
     """
     system_parts = []
     convo_parts = []
@@ -95,23 +168,42 @@ def messages_to_prompt(messages):
             if text:
                 system_parts.append(text)
         elif role == "assistant":
-            convo_parts.append(f"Assistant: {text}")
+            tcs = m.get("tool_calls")
+            if tcs:
+                rendered = []
+                for tc in tcs:
+                    fn = tc.get("function", {})
+                    rendered.append(
+                        f'```tool_call\n{{"name": "{fn.get("name","")}", '
+                        f'"arguments": {fn.get("arguments","{}")}}}\n```'
+                    )
+                joined = "\n".join(rendered)
+                convo_parts.append(f"Assistant (tool call):\n{joined}")
+            if text:
+                convo_parts.append(f"Assistant: {text}")
         elif role == "tool":
-            convo_parts.append(f"Tool result: {text}")
-        else:  # user (and anything else)
+            name = m.get("name") or m.get("tool_call_id") or "tool"
+            convo_parts.append(f"Tool result ({name}): {text}")
+        else:  # user and anything else
             convo_parts.append(f"User: {text}")
 
-    system_prompt = "\n\n".join(system_parts).strip()
+    if tools:
+        system_parts.append(build_tools_system_prompt(tools))
 
-    # If there's only a single user turn, send it bare (cleaner prompt).
-    user_msgs = [m for m in (messages or []) if m.get("role") not in ("system",)]
-    if len(user_msgs) == 1 and user_msgs[0].get("role") == "user":
-        prompt = _content_to_text(user_msgs[0].get("content"))
+    system_prompt = "\n\n".join(p for p in system_parts if p).strip()
+
+    non_system = [m for m in (messages or []) if m.get("role") != "system"]
+    if len(non_system) == 1 and non_system[0].get("role") == "user" and not tools:
+        prompt = _content_to_text(non_system[0].get("content"))
     else:
         prompt = "\n\n".join(convo_parts)
         prompt += "\n\nAssistant:"
     return system_prompt, prompt
 
+
+# ---------------------------------------------------------------------------
+# claude CLI invocation
+# ---------------------------------------------------------------------------
 
 def build_cli_args(model, system_prompt, stream):
     args = [CLAUDE_BIN, "-p", "--model", model or DEFAULT_MODEL]
@@ -129,12 +221,8 @@ def run_claude_blocking(model, system_prompt, prompt):
     args = build_cli_args(model, system_prompt, stream=False)
     try:
         proc = subprocess.run(
-            args,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=CALL_TIMEOUT,
-            cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
+            args, input=prompt, capture_output=True, text=True,
+            timeout=CALL_TIMEOUT, cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
         )
     except subprocess.TimeoutExpired:
         return None, {}, f"claude CLI timed out after {CALL_TIMEOUT}s"
@@ -148,7 +236,6 @@ def run_claude_blocking(model, system_prompt, prompt):
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Some configs print plain text; treat stdout as the answer.
         return raw, {}, None
 
     if data.get("is_error"):
@@ -167,19 +254,11 @@ def run_claude_blocking(model, system_prompt, prompt):
 
 
 def run_claude_stream(model, system_prompt, prompt):
-    """
-    Generator yielding text chunks as the CLI streams them.
-    Parses stream-json lines and extracts text_delta events.
-    """
+    """Generator yielding text chunks as the CLI streams (text answers only)."""
     args = build_cli_args(model, system_prompt, stream=True)
     proc = subprocess.Popen(
-        args,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
+        args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1, cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
     )
     proc.stdin.write(prompt)
     proc.stdin.close()
@@ -196,8 +275,6 @@ def run_claude_stream(model, system_prompt, prompt):
             except json.JSONDecodeError:
                 continue
             etype = evt.get("type")
-
-            # Partial streaming deltas (preferred, token-by-token).
             if etype == "stream_event":
                 inner = evt.get("event", {})
                 if inner.get("type") == "content_block_delta":
@@ -207,13 +284,11 @@ def run_claude_stream(model, system_prompt, prompt):
                         if chunk:
                             emitted_any = True
                             yield chunk
-            # Full assistant message (fallback if partials are off).
             elif etype == "assistant" and not emitted_any:
                 msg = evt.get("message", {})
                 for block in msg.get("content", []) or []:
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_full_text = block.get("text", "")
-            # Final result line — flush full text if nothing streamed.
             elif etype == "result" and not emitted_any:
                 final = evt.get("result", "") or last_full_text
                 if final:
@@ -244,7 +319,6 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error(self, msg, code=500, etype="server_error"):
         self._send_json({"error": {"message": msg, "type": etype}}, code)
 
-    # --- GET ---------------------------------------------------------------
     def do_GET(self):
         if self.path.rstrip("/") in ("/health", ""):
             return self._send_json({"ok": True})
@@ -259,11 +333,9 @@ class Handler(BaseHTTPRequestHandler):
             })
         return self._send_error("not found", 404, "invalid_request_error")
 
-    # --- POST --------------------------------------------------------------
     def do_POST(self):
         if not self.path.rstrip("/").endswith("/chat/completions"):
             return self._send_error("not found", 404, "invalid_request_error")
-
         length = int(self.headers.get("Content-Length", 0) or 0)
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -272,40 +344,45 @@ class Handler(BaseHTTPRequestHandler):
 
         model = payload.get("model") or DEFAULT_MODEL
         stream = bool(payload.get("stream"))
-        system_prompt, prompt = messages_to_prompt(payload.get("messages", []))
-
+        tools = payload.get("tools") or None
+        system_prompt, prompt = messages_to_prompt(payload.get("messages", []), tools)
         if not prompt.strip():
             return self._send_error("no prompt content in messages", 400, "invalid_request_error")
 
         if stream:
-            return self._handle_stream(model, system_prompt, prompt)
-        return self._handle_blocking(model, system_prompt, prompt)
+            return self._handle_stream(model, system_prompt, prompt, tools)
+        return self._handle_blocking(model, system_prompt, prompt, tools)
 
-    def _handle_blocking(self, model, system_prompt, prompt):
+    def _handle_blocking(self, model, system_prompt, prompt, tools):
         text, usage, err = run_claude_blocking(model, system_prompt, prompt)
         if err:
             return self._send_error(err, 502, "upstream_error")
+
+        message = {"role": "assistant", "content": text}
+        finish = "stop"
+        if tools:
+            calls, leftover = extract_tool_calls(text)
+            if calls:
+                message = {"role": "assistant", "content": leftover or None,
+                           "tool_calls": calls}
+                finish = "tool_calls"
+
         resp = {
             "id": "chatcmpl-" + uuid.uuid4().hex[:24],
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
             "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
         return self._send_json(resp)
 
-    def _handle_stream(self, model, system_prompt, prompt):
+    def _handle_stream(self, model, system_prompt, prompt, tools):
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        # Close after the stream so clients/sockets terminate cleanly at [DONE].
         self.send_header("Connection", "close")
         self.close_connection = True
         self.end_headers()
@@ -314,38 +391,50 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
             self.wfile.flush()
 
-        # role preamble chunk
-        sse({
-            "id": cid, "object": "chat.completion.chunk", "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        })
-        try:
-            for chunk in run_claude_stream(model, system_prompt, prompt):
-                sse({
-                    "id": cid, "object": "chat.completion.chunk", "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
-                })
-        except Exception as e:  # noqa: BLE001
-            sse({
+        def chunk(delta, finish=None):
+            return {
                 "id": cid, "object": "chat.completion.chunk", "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": {"content": f"\n[proxy error: {e}]"}, "finish_reason": None}],
-            })
-        # final stop chunk + DONE
-        sse({
-            "id": cid, "object": "chat.completion.chunk", "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        })
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+
+        sse(chunk({"role": "assistant"}))
+
+        # When tools are offered, generate fully (blocking) so we can detect and
+        # emit tool_calls; streaming token-by-token can't be re-parsed mid-flight.
+        if tools:
+            text, _usage, err = run_claude_blocking(model, system_prompt, prompt)
+            if err:
+                sse(chunk({"content": f"[proxy error: {err}]"}))
+                sse(chunk({}, finish="stop"))
+            else:
+                calls, leftover = extract_tool_calls(text or "")
+                if calls:
+                    tc_delta = [{
+                        "index": i, "id": c["id"], "type": "function",
+                        "function": c["function"],
+                    } for i, c in enumerate(calls)]
+                    if leftover:
+                        sse(chunk({"content": leftover}))
+                    sse(chunk({"tool_calls": tc_delta}))
+                    sse(chunk({}, finish="tool_calls"))
+                else:
+                    if text:
+                        sse(chunk({"content": text}))
+                    sse(chunk({}, finish="stop"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+
+        try:
+            for piece in run_claude_stream(model, system_prompt, prompt):
+                sse(chunk({"content": piece}))
+        except Exception as e:  # noqa: BLE001
+            sse(chunk({"content": f"\n[proxy error: {e}]"}))
+        sse(chunk({}, finish="stop"))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="OpenAI-compatible proxy for the claude CLI")

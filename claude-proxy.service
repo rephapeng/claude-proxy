@@ -1,0 +1,23 @@
+[Unit]
+Description=claude-openai-proxy (OpenAI-compatible wrapper for the claude CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the user that authenticated Claude Code (so ~/.claude credentials resolve).
+# Edit User= and the paths to match your host.
+User=%i
+WorkingDirectory=/opt/claude-proxy
+Environment=CLAUDE_PROXY_HOST=127.0.0.1
+Environment=CLAUDE_PROXY_PORT=8088
+Environment=CLAUDE_PROXY_DEFAULT_MODEL=sonnet
+Environment=CLAUDE_PROXY_TIMEOUT=600
+# If `claude` is not on the default PATH, point to it explicitly:
+# Environment=CLAUDE_BIN=/root/.local/bin/claude
+ExecStart=/usr/bin/python3 /opt/claude-proxy/claude_openai_proxy.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

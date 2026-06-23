@@ -1,0 +1,17 @@
+services:
+  claude-proxy:
+    build: .
+    image: claude-proxy
+    container_name: claude-proxy
+    ports:
+      - "8088:8088"
+    environment:
+      CLAUDE_PROXY_HOST: 0.0.0.0
+      CLAUDE_PROXY_PORT: "8088"
+      CLAUDE_PROXY_DEFAULT_MODEL: sonnet
+      CLAUDE_PROXY_TIMEOUT: "600"
+    volumes:
+      # Mount your authenticated Claude Code credentials (read-write: the CLI
+      # may refresh tokens). Created on the host by running `claude` once.
+      - ${HOME}/.claude:/root/.claude
+    restart: unless-stopped
