@@ -33,6 +33,7 @@ to authenticate). No `pip install` needed.
 | `CLAUDE_PROXY_TIMEOUT`        | `600`    | per-call CLI timeout (seconds)       |
 | `CLAUDE_PROXY_HOST` / `_PORT` | `127.0.0.1` / `8088` | bind address             |
 | `CLAUDE_BIN`                  | `claude` | path to the CLI                      |
+| `CLAUDE_PROXY_MAX_CONCURRENCY` | `2` | max concurrent `claude` processes (0=unlimited); cap to host RAM |
 
 ## Point a client at it
 

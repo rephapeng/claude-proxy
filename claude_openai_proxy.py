@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +42,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_MODEL = os.environ.get("CLAUDE_PROXY_DEFAULT_MODEL", "sonnet")
 CALL_TIMEOUT = int(os.environ.get("CLAUDE_PROXY_TIMEOUT", "600"))
+
+# Each request spawns a `claude` CLI process that can use 200-400 MB of RAM.
+# On small hosts, too many at once causes swap thrashing or OOM kills. This
+# semaphore caps how many CLI processes run concurrently; excess requests WAIT
+# (queue) instead of piling on. 0 = unlimited. Set to match the host's RAM:
+# roughly (free_RAM_MB / 350). Default 2 is safe for a ~2 GB box.
+MAX_CONCURRENCY = int(os.environ.get("CLAUDE_PROXY_MAX_CONCURRENCY", "2"))
+_cli_slots = threading.BoundedSemaphore(MAX_CONCURRENCY) if MAX_CONCURRENCY > 0 else None
+
+
+class _cli_gate:
+    """Context manager: limit concurrent claude CLI processes (no-op if unlimited)."""
+    def __enter__(self):
+        if _cli_slots is not None:
+            _cli_slots.acquire()
+        return self
+    def __exit__(self, *exc):
+        if _cli_slots is not None:
+            _cli_slots.release()
+        return False
 
 EXPOSED_MODELS = [
     "claude-sonnet-4-6",
@@ -220,10 +241,11 @@ def run_claude_blocking(model, system_prompt, prompt):
     """Run claude in --output-format json mode, return (text, usage_dict, error)."""
     args = build_cli_args(model, system_prompt, stream=False)
     try:
-        proc = subprocess.run(
-            args, input=prompt, capture_output=True, text=True,
-            timeout=CALL_TIMEOUT, cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
-        )
+        with _cli_gate():
+            proc = subprocess.run(
+                args, input=prompt, capture_output=True, text=True,
+                timeout=CALL_TIMEOUT, cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
+            )
     except subprocess.TimeoutExpired:
         return None, {}, f"claude CLI timed out after {CALL_TIMEOUT}s"
     except FileNotFoundError:
@@ -256,6 +278,8 @@ def run_claude_blocking(model, system_prompt, prompt):
 def run_claude_stream(model, system_prompt, prompt):
     """Generator yielding text chunks as the CLI streams (text answers only)."""
     args = build_cli_args(model, system_prompt, stream=True)
+    gate = _cli_gate()
+    gate.__enter__()  # hold a CLI slot for the whole streamed response
     proc = subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, cwd=os.environ.get("CLAUDE_PROXY_CWD", "/tmp"),
@@ -295,7 +319,10 @@ def run_claude_stream(model, system_prompt, prompt):
                     yield final
     finally:
         proc.stdout.close()
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=10)
+        finally:
+            gate.__exit__(None, None, None)  # release the CLI slot
 
 
 # ---------------------------------------------------------------------------
