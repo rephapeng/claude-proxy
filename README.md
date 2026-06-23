@@ -1,12 +1,12 @@
 # claude-openai-proxy
 
 A ~300-line, **zero-dependency** (stdlib-only) OpenAI-compatible HTTP proxy that
-wraps the local `claude` (Claude Code) CLI. It lets any OpenAI-API client — such
-as **Evonic** — use your authenticated Claude Code session, including a **Claude
-Max** subscription that has no raw API key.
+wraps the local `claude` (Claude Code) CLI. It lets any OpenAI-API client (agent
+frameworks, IDE plugins, SDKs, your own scripts) use your authenticated Claude
+Code session, including a **Claude Max** subscription that has no raw API key.
 
 ```
-Evonic ──OpenAI /v1/chat/completions──▶ claude_openai_proxy.py ──▶ claude CLI ──▶ Anthropic
+OpenAI-API client ──/v1/chat/completions──▶ claude_openai_proxy.py ──▶ claude CLI ──▶ Anthropic
 ```
 
 ## Run
@@ -34,20 +34,34 @@ to authenticate). No `pip install` needed.
 | `CLAUDE_PROXY_HOST` / `_PORT` | `127.0.0.1` / `8088` | bind address             |
 | `CLAUDE_BIN`                  | `claude` | path to the CLI                      |
 
-## Point Evonic at it
+## Point a client at it
 
-In `.env` (or the Evonic web UI → Models), use the **OpenAI** provider format
-(the default — do **not** pick "anthropic"; this proxy speaks `/chat/completions`,
-not `/messages`):
+Configure your client like any OpenAI-compatible endpoint:
 
+| Setting   | Value                                            |
+|-----------|--------------------------------------------------|
+| Base URL  | `http://localhost:8088/v1`                       |
+| API key   | any non-empty string (ignored by the proxy)      |
+| Model     | `sonnet` (or `opus`, `haiku`, `claude-sonnet-4-6`, …) |
+
+Common forms:
+
+```bash
+# OpenAI Python SDK
+export OPENAI_BASE_URL=http://localhost:8088/v1
+export OPENAI_API_KEY=ignored
+```
 ```ini
+# typical .env-style config
 LLM_BASE_URL=http://localhost:8088/v1
 LLM_API_KEY=ignored-but-required
-LLM_MODEL=sonnet            # or claude-sonnet-4-6, opus, haiku, etc.
+LLM_MODEL=sonnet
 ```
 
-Evonic chooses its wire format from the provider's `api_format` field (default
-`openai`), not from the model name, so any model id routes correctly here.
+Use the client's **OpenAI / OpenAI-compatible** mode — not its native
+"Anthropic" mode. This proxy speaks `/chat/completions`, not Anthropic's
+`/messages`. Whatever model id you send is passed straight to `claude --model`,
+so aliases (`sonnet`/`opus`/`haiku`) and full ids both work.
 
 ## How it maps OpenAI → CLI
 - `system` messages → `--append-system-prompt`
@@ -69,8 +83,8 @@ CLI has no native OpenAI tool-calling in `-p` mode):
    `tool_calls` are rendered into the transcript so the model can produce a final
    answer.
 
-This is reliable for normal agentic loops (Evonic's included) but is prompt-based,
-not a native API feature — very large/complex tool schemas may need tuning.
+This is reliable for normal agentic loops but is prompt-based, not a native API
+feature — very large/complex tool schemas may need tuning.
 
 ## Keep it running
 

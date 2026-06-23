@@ -3,9 +3,9 @@
 claude_openai_proxy.py
 ----------------------
 A tiny, zero-dependency OpenAI-compatible HTTP proxy that wraps the local
-`claude` (Claude Code) CLI. It lets any OpenAI-API client (e.g. Evonic) talk to
-your authenticated Claude Code session — including a Claude Max subscription,
-which has no raw API key.
+`claude` (Claude Code) CLI. It lets any OpenAI-API client talk to your
+authenticated Claude Code session — including a Claude Max subscription, which
+has no raw API key.
 
 Endpoints:
   GET  /v1/models             -> list exposed model ids
@@ -15,7 +15,7 @@ Endpoints:
 
 Usage:
   python3 claude_openai_proxy.py --port 8088
-  (then point Evonic at  http://localhost:8088/v1 , any api key)
+  (then point any OpenAI client at  http://localhost:8088/v1 , any api key)
 
 Stdlib only. No pip install required.
 
