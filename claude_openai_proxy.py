@@ -165,7 +165,14 @@ def messages_to_prompt(messages, tools=None, handler=None):
 # ---------------------------------------------------------------------------
 
 def build_cli_args(model, system_prompt, stream):
-    args = [CLAUDE_BIN, "-p", "--model", model or DEFAULT_MODEL]
+    # --tools "" disables ALL of Claude Code's built-in tools (Bash, Read,
+    # WebFetch, ...). This proxy is a pure LLM endpoint: the host app (e.g.
+    # evonic) owns tool execution and offers its tools via the prompt protocol.
+    # If the CLI's native tools stay live, the model executes things ITSELF —
+    # auto-running some commands and hitting "requires approval" on sensitive
+    # ones (SSH, WebFetch) in non-interactive -p mode — instead of emitting a
+    # tool_call for the host to run. Disabling them forces clean delegation.
+    args = [CLAUDE_BIN, "-p", "--model", model or DEFAULT_MODEL, "--tools", ""]
     if stream:
         args += ["--output-format", "stream-json", "--include-partial-messages", "--verbose"]
     else:
