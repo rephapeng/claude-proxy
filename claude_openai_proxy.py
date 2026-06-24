@@ -108,7 +108,33 @@ def _content_to_text(content):
 # so the model has the full picture.
 # ---------------------------------------------------------------------------
 
-TOOL_CALL_RE = re.compile(r"```tool_call\s*(\{.*?\})\s*```", re.DOTALL)
+TOOL_CALL_RE = re.compile(r"```(?:tool_call|json)\s*(\{.*?\})\s*```", re.DOTALL)
+
+# Claude models are heavily trained to emit their NATIVE tool-use syntax —
+# <function_calls><invoke name="x"><parameter name="y">val</parameter>...</invoke>.
+# Under the prompt-emulation protocol they mostly comply with the fenced
+# ```tool_call``` form, but sometimes fall back to this native form. Catch it
+# too so a leaked native call still becomes a proper OpenAI tool_call.
+NATIVE_INVOKE_RE = re.compile(
+    r"<invoke\s+name=\"([^\"]+)\">(.*?)</invoke>", re.DOTALL
+)
+NATIVE_PARAM_RE = re.compile(
+    r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>", re.DOTALL
+)
+NATIVE_BLOCK_RE = re.compile(r"<function_calls>.*?</function_calls>", re.DOTALL)
+
+# Signals that the model REFUSED a tool instead of calling it — e.g. it decided
+# the (prompt-injected) tool "isn't really available" and apologized or asked the
+# user to act manually. The claude CLI is itself Claude Code, with its own native
+# tool registry; injected tools can trip this false "unavailable" refusal. When we
+# see this with tools on offer and no call produced, we retry with a hard nudge.
+_REFUSAL_RE = re.compile(
+    r"tidak tersedia|tidak bisa|tidak dapat|tidak memiliki|secara manual|"
+    r"kendala teknis|hubungi (tim )?support|not available|unavailable|"
+    r"i (?:do not|don't) have|i'm unable|i am unable|i cannot|i can't|"
+    r"do(?:es)? not have access|no access to|manually",
+    re.IGNORECASE,
+)
 
 
 def build_tools_system_prompt(tools):
@@ -116,8 +142,18 @@ def build_tools_system_prompt(tools):
     if not tools:
         return ""
     lines = [
-        "You have access to the following tools (functions). When you need to "
-        "call one, respond with ONLY a fenced code block of the form:",
+        "You are operating as a FUNCTION-CALLING INTERFACE for a host application. "
+        "The tools listed below are REAL: they are wired to a live backend that "
+        "actually executes them and returns results. They are fully available right "
+        "now regardless of your own built-in capabilities or environment.",
+        "",
+        "HARD RULES:",
+        "- Never claim a listed tool is unavailable, not supported, or blocked.",
+        "- Never apologize about a 'technical issue' or 'environment' for a listed tool.",
+        "- Never ask the user to perform a listed tool's action manually.",
+        "- If the user's request maps to a listed tool, you MUST call it.",
+        "",
+        "To call a tool, respond with ONLY a fenced code block of the form:",
         "",
         "```tool_call",
         '{"name": "<function_name>", "arguments": {<json args>}}',
@@ -125,7 +161,7 @@ def build_tools_system_prompt(tools):
         "",
         "Emit one such block per tool call. You may emit multiple blocks to call "
         "several tools. Do not add prose around the block(s) when calling a tool. "
-        "If you do not need a tool, just answer normally.",
+        "If (and only if) no listed tool fits the request, just answer normally.",
         "",
         "Available tools:",
     ]
@@ -142,32 +178,97 @@ def build_tools_system_prompt(tools):
     return "\n".join(lines)
 
 
+def _append_call(calls, name, args):
+    """Append one normalized OpenAI tool_call. args may be dict or json str."""
+    if not name:
+        return
+    if not isinstance(args, str):
+        args = json.dumps(args)
+    calls.append({
+        "id": "call_" + uuid.uuid4().hex[:24],
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    })
+
+
 def extract_tool_calls(text):
     """
-    Find ```tool_call {json}``` blocks in model output.
+    Parse tool calls out of model output, tolerating multiple formats:
+      1. ```tool_call {json}``` or ```json {json}``` fenced blocks (preferred)
+      2. Claude-native <function_calls><invoke name=...><parameter ...> blocks
     Returns (list_of_openai_tool_calls, leftover_text).
     """
-    if not text or "tool_call" not in text:
+    if not text:
         return [], text
     calls = []
-    for m in TOOL_CALL_RE.finditer(text):
-        try:
-            obj = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            continue
-        name = obj.get("name")
-        if not name:
-            continue
-        args = obj.get("arguments", {})
-        if not isinstance(args, str):
-            args = json.dumps(args)
-        calls.append({
-            "id": "call_" + uuid.uuid4().hex[:24],
-            "type": "function",
-            "function": {"name": name, "arguments": args},
-        })
-    leftover = TOOL_CALL_RE.sub("", text).strip()
+
+    # 1. Fenced JSON blocks ({"name","arguments"}).
+    if "```" in text:
+        for m in TOOL_CALL_RE.finditer(text):
+            try:
+                obj = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("name"):
+                _append_call(calls, obj.get("name"), obj.get("arguments", {}))
+        text_wo_fences = TOOL_CALL_RE.sub("", text)
+    else:
+        text_wo_fences = text
+
+    # 2. Claude-native <invoke> blocks the model leaked instead of the fence.
+    if "<invoke" in text_wo_fences:
+        for m in NATIVE_INVOKE_RE.finditer(text_wo_fences):
+            name = m.group(1)
+            args = {}
+            for pm in NATIVE_PARAM_RE.finditer(m.group(2)):
+                raw = pm.group(2).strip()
+                try:
+                    args[pm.group(1)] = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    args[pm.group(1)] = raw
+            _append_call(calls, name, args)
+
+    leftover = NATIVE_BLOCK_RE.sub("", text)
+    leftover = TOOL_CALL_RE.sub("", leftover)
+    leftover = NATIVE_INVOKE_RE.sub("", leftover).strip()
     return calls, leftover
+
+
+# Hard nudge replayed when tools were on offer but the model refused / produced
+# no call. Pushes it to either call a tool or, if truly none fit, answer plainly.
+_TOOL_NUDGE = (
+    "Your previous reply did not call any tool and instead refused or described "
+    "the action. The listed tools ARE available and execute on a real backend. "
+    "Re-read the user's request: if any listed tool fits it, respond now with "
+    "ONLY the ```tool_call``` block(s) — no apologies, no 'unavailable', no manual "
+    "instructions. If genuinely no listed tool fits, answer the user normally."
+)
+
+
+def complete_with_tools(model, system_prompt, prompt):
+    """
+    Run claude once, extract tool calls. If tools were offered (system_prompt
+    carries the tool block) and the model refused without calling anything,
+    retry ONCE with a corrective nudge. Returns (calls, leftover_text, err).
+    """
+    text, _usage, err = run_claude_blocking(model, system_prompt, prompt)
+    if err:
+        return [], None, err
+    calls, leftover = extract_tool_calls(text or "")
+    if not calls and _REFUSAL_RE.search(text or ""):
+        retry_prompt = (
+            f"{prompt}\n\nAssistant (rejected draft): {text}\n\n"
+            f"[SYSTEM CORRECTION] {_TOOL_NUDGE}\n\nAssistant:"
+        )
+        text2, _u2, err2 = run_claude_blocking(model, system_prompt, retry_prompt)
+        if not err2 and text2:
+            calls2, leftover2 = extract_tool_calls(text2)
+            if calls2:
+                return calls2, leftover2, None
+            # Keep the better (non-refusing) text if the retry produced one.
+            if not _REFUSAL_RE.search(text2):
+                return [], leftover2, None
+    return calls, leftover, None
 
 
 def messages_to_prompt(messages, tools=None):
@@ -381,20 +482,30 @@ class Handler(BaseHTTPRequestHandler):
         return self._handle_blocking(model, system_prompt, prompt, tools)
 
     def _handle_blocking(self, model, system_prompt, prompt, tools):
+        if tools:
+            calls, leftover, err = complete_with_tools(model, system_prompt, prompt)
+            if err:
+                return self._send_error(err, 502, "upstream_error")
+            usage = {}
+            if calls:
+                message = {"role": "assistant", "content": leftover or None,
+                           "tool_calls": calls}
+                finish = "tool_calls"
+            else:
+                message = {"role": "assistant", "content": leftover}
+                finish = "stop"
+            return self._send_json(self._completion_envelope(model, message, finish, usage))
+
         text, usage, err = run_claude_blocking(model, system_prompt, prompt)
         if err:
             return self._send_error(err, 502, "upstream_error")
 
         message = {"role": "assistant", "content": text}
         finish = "stop"
-        if tools:
-            calls, leftover = extract_tool_calls(text)
-            if calls:
-                message = {"role": "assistant", "content": leftover or None,
-                           "tool_calls": calls}
-                finish = "tool_calls"
+        return self._send_json(self._completion_envelope(model, message, finish, usage))
 
-        resp = {
+    def _completion_envelope(self, model, message, finish, usage):
+        return {
             "id": "chatcmpl-" + uuid.uuid4().hex[:24],
             "object": "chat.completion",
             "created": int(time.time()),
@@ -402,7 +513,6 @@ class Handler(BaseHTTPRequestHandler):
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
             "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
-        return self._send_json(resp)
 
     def _handle_stream(self, model, system_prompt, prompt, tools):
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -430,25 +540,23 @@ class Handler(BaseHTTPRequestHandler):
         # When tools are offered, generate fully (blocking) so we can detect and
         # emit tool_calls; streaming token-by-token can't be re-parsed mid-flight.
         if tools:
-            text, _usage, err = run_claude_blocking(model, system_prompt, prompt)
+            calls, leftover, err = complete_with_tools(model, system_prompt, prompt)
             if err:
                 sse(chunk({"content": f"[proxy error: {err}]"}))
                 sse(chunk({}, finish="stop"))
+            elif calls:
+                tc_delta = [{
+                    "index": i, "id": c["id"], "type": "function",
+                    "function": c["function"],
+                } for i, c in enumerate(calls)]
+                if leftover:
+                    sse(chunk({"content": leftover}))
+                sse(chunk({"tool_calls": tc_delta}))
+                sse(chunk({}, finish="tool_calls"))
             else:
-                calls, leftover = extract_tool_calls(text or "")
-                if calls:
-                    tc_delta = [{
-                        "index": i, "id": c["id"], "type": "function",
-                        "function": c["function"],
-                    } for i, c in enumerate(calls)]
-                    if leftover:
-                        sse(chunk({"content": leftover}))
-                    sse(chunk({"tool_calls": tc_delta}))
-                    sse(chunk({}, finish="tool_calls"))
-                else:
-                    if text:
-                        sse(chunk({"content": text}))
-                    sse(chunk({}, finish="stop"))
+                if leftover:
+                    sse(chunk({"content": leftover}))
+                sse(chunk({}, finish="stop"))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return

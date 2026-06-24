@@ -87,6 +87,19 @@ CLI has no native OpenAI tool-calling in `-p` mode):
 This is reliable for normal agentic loops but is prompt-based, not a native API
 feature — very large/complex tool schemas may need tuning.
 
+**False-refusal hardening.** The `claude` CLI is itself Claude Code, with its own
+native tool registry; it occasionally treats a prompt-injected tool as "not
+available" and apologizes instead of calling it (so the host app's action never
+runs). The proxy guards against this:
+1. The injected tool instruction states the tools are real, wired to a live
+   backend, and forbids "unavailable"/"do it manually" refusals.
+2. The parser accepts both the fenced ```` ```tool_call ````/```` ```json ```` form
+   **and** Claude's native `<function_calls><invoke …>` form, so a leaked native
+   call still becomes a proper `tool_calls`.
+3. If tools were offered but the model refused without calling anything, the proxy
+   retries once with a hard corrective nudge — forcing a real tool call, or a
+   normal answer when genuinely no tool fits.
+
 ## Keep it running
 
 ### systemd
