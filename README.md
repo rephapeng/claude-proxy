@@ -100,6 +100,13 @@ runs). The proxy guards against this:
    retries once with a hard corrective nudge — forcing a real tool call, or a
    normal answer when genuinely no tool fits.
 
+## Host integrations
+Per-host tool-call handlers live in `modules/` and are auto-discovered (subclass
+`BaseToolCallHandler`, call `register()`, select via `X-Toolcall-Module` header or
+`CLAUDE_PROXY_TOOLCALL_MODULE`). For a full worked example of wiring a host app to
+the proxy — disabling native CLI tools, prompt-emulated tool calls, false-refusal
+hardening, and end-to-end setup — see [`docs/evonic-integration.md`](docs/evonic-integration.md).
+
 ## Keep it running
 
 ### systemd
